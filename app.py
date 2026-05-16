@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 # ============================================================
-# 物品管理アプリ Ver2.1 SQLite安定性強化版
+# 物品管理アプリ Ver2.1.1 SQLite安定性強化版
 # ・SQLiteリレーショナルDB保存
 # ・自動バックアップ / 手動バックアップ
 # ・削除確認チェック
@@ -17,7 +17,7 @@ import streamlit as st
 # ・管理者 / 職員 ログイン
 # ============================================================
 
-st.set_page_config(page_title="物品管理アプリ Ver2.1 ", layout="wide")
+st.set_page_config(page_title="物品管理アプリ Ver2.1.1 SQLite安定性強化版", layout="wide")
 
 DATA = Path("data")
 DATA.mkdir(exist_ok=True)
@@ -114,6 +114,43 @@ def list_backups():
             "path": str(f),
         })
     return pd.DataFrame(rows)
+
+
+
+def restore_db_from_upload(uploaded_file):
+    """アップロードされたDBファイルで現在のDBを置き換える。置き換え前に自動バックアップを作成。"""
+    if uploaded_file is None:
+        return None
+
+    # 復元前に現在DBを退避
+    backup_db(reason="before_restore")
+
+    temp_path = BACKUP_DIR / f"uploaded_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+    with open(temp_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    # SQLiteとして開けるか簡易確認
+    try:
+        test_conn = sqlite3.connect(temp_path)
+        test_conn.execute("SELECT name FROM sqlite_master LIMIT 1")
+        test_conn.close()
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise ValueError("アップロードされたファイルはSQLite DBとして読み込めません。")
+
+    shutil.copy2(temp_path, DB_PATH)
+    return temp_path
+
+
+def delete_backup_file(path_text):
+    """指定されたバックアップファイルを削除する。"""
+    target = Path(path_text)
+    if not target.exists():
+        return False
+    if target.parent.resolve() != BACKUP_DIR.resolve():
+        return False
+    target.unlink()
+    return True
 
 
 def init_db():
@@ -374,7 +411,7 @@ def usage_warnings(use_date, user_id, item_id, qty, unit_price, exclude_id=None)
 # ============================================================
 
 def login_screen():
-    st.title("📦 物品管理アプリ Ver2.1 SQLite安定性強化版")
+    st.title("📦 物品管理アプリ Ver2.1.1 SQLite安定性強化版")
     st.subheader("ログイン")
 
     with st.form("login_form"):
@@ -431,7 +468,7 @@ init_db()
 auto_backup_once_per_day()
 require_login()
 
-st.title("📦 物品管理アプリ Ver2.1 SQLite安定性強化版")
+st.title("📦 物品管理アプリ Ver2.1.1 SQLite安定性強化版")
 st.caption("自動バックアップ／手動バックアップ／削除確認／入力ミス警告／SQLiteリレーショナルDB")
 
 role = st.session_state.get("role", "職員")
@@ -1182,7 +1219,7 @@ elif menu == "ログイン設定":
                 st.success("アカウントを削除しました。")
                 st.rerun()
 
-    st.warning("注意：このVer2.1ではパスワードはSQLiteに平文保存です。施設内の簡易テスト向けです。")
+    st.warning("注意：このVer2.1.1ではパスワードはSQLiteに平文保存です。施設内の簡易テスト向けです。")
 
 
 # ============================================================
@@ -1190,35 +1227,86 @@ elif menu == "ログイン設定":
 # ============================================================
 elif menu == "バックアップ管理":
     st.subheader("バックアップ管理")
-    st.caption("DBの自動バックアップ・手動バックアップ・ダウンロードを行います。")
+    st.caption("DBの自動バックアップ・手動バックアップ・ダウンロード・削除・アップロード復元を行います。")
 
-    if st.button("手動バックアップを作成する"):
-        path = backup_db(reason="manual")
-        if path:
-            st.success(f"バックアップを作成しました：{path.name}")
+    tab_backup, tab_restore = st.tabs(["バックアップ作成・一覧", "バックアップDBアップロード復元"])
+
+    with tab_backup:
+        st.markdown("### 手動バックアップ")
+
+        if st.button("手動バックアップを作成する"):
+            path = backup_db(reason="manual")
+            if path:
+                st.success(f"バックアップを作成しました：{path.name}")
+            else:
+                st.error("DBファイルが見つかりません。")
+
+        st.markdown("---")
+        st.markdown("### バックアップ一覧")
+
+        backups = list_backups()
+
+        if backups.empty:
+            st.info("バックアップはまだありません。")
         else:
-            st.error("DBファイルが見つかりません。")
+            st.dataframe(backups.drop(columns=["path"]), use_container_width=True)
 
-    st.markdown("### バックアップ一覧")
-    backups = list_backups()
+            selected_name = st.selectbox("対象バックアップ", backups["ファイル名"].tolist())
+            selected_path = backups[backups["ファイル名"] == selected_name].iloc[0]["path"]
 
-    if backups.empty:
-        st.info("バックアップはまだありません。")
-    else:
-        st.dataframe(backups.drop(columns=["path"]), use_container_width=True)
+            st.markdown("#### ダウンロード")
+            with open(selected_path, "rb") as f:
+                st.download_button(
+                    "選択したバックアップDBをダウンロード",
+                    f.read(),
+                    file_name=selected_name,
+                    mime="application/octet-stream"
+                )
 
-        selected_name = st.selectbox("ダウンロードするバックアップ", backups["ファイル名"].tolist())
-        selected_path = backups[backups["ファイル名"] == selected_name].iloc[0]["path"]
+            st.markdown("---")
+            st.markdown("#### バックアップ削除")
+            st.warning("バックアップ削除は取り消せません。不要な古いバックアップだけ削除してください。")
 
-        with open(selected_path, "rb") as f:
-            st.download_button(
-                "選択したバックアップDBをダウンロード",
-                f.read(),
-                file_name=selected_name,
-                mime="application/octet-stream"
-            )
+            delete_confirm = st.checkbox("このバックアップを削除することを確認しました。")
+            delete_text = st.text_input("削除する場合は DELETE と入力", key="backup_delete_text")
 
-    st.info("自動バックアップはアプリ起動時に1日1回作成されます。保存先は data/backups/ です。")
+            if st.button("選択したバックアップを削除する"):
+                if not delete_confirm or delete_text != "DELETE":
+                    st.error("削除するには確認チェックを入れ、DELETE と入力してください。")
+                else:
+                    ok = delete_backup_file(selected_path)
+                    if ok:
+                        st.success("バックアップを削除しました。")
+                        st.rerun()
+                    else:
+                        st.error("バックアップを削除できませんでした。")
+
+        st.info("自動バックアップはアプリ起動時に1日1回作成されます。保存先は data/backups/ です。")
+
+    with tab_restore:
+        st.markdown("### バックアップDBアップロード復元")
+        st.warning(
+            "アップロード復元を行うと、現在のDBがアップロードしたDBに置き換わります。"
+            "実行前に現在DBは自動で before_restore バックアップされます。"
+        )
+
+        uploaded = st.file_uploader("復元するSQLite DBファイル（.db）を選択", type=["db", "sqlite", "sqlite3"])
+
+        restore_confirm = st.checkbox("現在のDBを置き換えることを確認しました。")
+        restore_text = st.text_input("復元する場合は RESTORE と入力", key="restore_text")
+
+        if st.button("アップロードしたDBで復元する"):
+            if uploaded is None:
+                st.error("復元するDBファイルを選択してください。")
+            elif not restore_confirm or restore_text != "RESTORE":
+                st.error("復元するには確認チェックを入れ、RESTORE と入力してください。")
+            else:
+                try:
+                    restored_path = restore_db_from_upload(uploaded)
+                    st.success(f"DBを復元しました：{restored_path.name}")
+                    st.info("反映のため、画面を再読み込みするか、ログアウト後に再ログインしてください。")
+                except Exception as e:
+                    st.error(f"復元に失敗しました：{e}")
 
 
 # ============================================================
