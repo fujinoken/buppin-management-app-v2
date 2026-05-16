@@ -1,4 +1,5 @@
 import sqlite3
+import shutil
 from datetime import date, datetime
 from pathlib import Path
 import calendar
@@ -7,19 +8,22 @@ import pandas as pd
 import streamlit as st
 
 # ============================================================
-# 物品管理アプリ Ver2.0 SQLite版
-# ・Ver1.5.1 Excel版とは別アプリとして並行テスト用
+# 物品管理アプリ Ver2.1 SQLite安定性強化版
 # ・SQLiteリレーショナルDB保存
+# ・自動バックアップ / 手動バックアップ
+# ・削除確認チェック
+# ・数量・単価・在庫マイナス警告
+# ・重複登録警告
 # ・管理者 / 職員 ログイン
-# ・職員は「使用記録 登録」「使用記録 検索・更新・削除」のみ
-# ・在庫ショート予防 / FEED発注補助 / 月末請求
 # ============================================================
 
-st.set_page_config(page_title="物品管理アプリ Ver2.0 SQLite版", layout="wide")
+st.set_page_config(page_title="物品管理アプリ Ver2.1 ", layout="wide")
 
 DATA = Path("data")
 DATA.mkdir(exist_ok=True)
 DB_PATH = DATA / "buppin_app.db"
+BACKUP_DIR = DATA / "backups"
+BACKUP_DIR.mkdir(exist_ok=True)
 
 ADMIN_MENUS = [
     "管理ダッシュボード",
@@ -32,6 +36,7 @@ ADMIN_MENUS = [
     "利用者マスタ 登録・更新・削除",
     "物品マスタ 登録・更新・削除",
     "ログイン設定",
+    "バックアップ管理",
     "データ確認",
 ]
 
@@ -71,6 +76,44 @@ def safe_int(v):
 
 def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def backup_db(reason="manual"):
+    """DBをバックアップする。reason: auto / manual"""
+    if not DB_PATH.exists():
+        return None
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = BACKUP_DIR / f"buppin_app_backup_{reason}_{stamp}.db"
+    shutil.copy2(DB_PATH, backup_path)
+    return backup_path
+
+
+def auto_backup_once_per_day():
+    """1日1回だけ自動バックアップ"""
+    if not DB_PATH.exists():
+        return None
+
+    today = date.today().strftime("%Y%m%d")
+    existing = list(BACKUP_DIR.glob(f"buppin_app_backup_auto_{today}_*.db"))
+
+    if existing:
+        return existing[0]
+
+    return backup_db(reason="auto")
+
+
+def list_backups():
+    files = sorted(BACKUP_DIR.glob("*.db"), reverse=True)
+    rows = []
+    for f in files:
+        rows.append({
+            "ファイル名": f.name,
+            "サイズKB": round(f.stat().st_size / 1024, 1),
+            "作成日時": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            "path": str(f),
+        })
+    return pd.DataFrame(rows)
 
 
 def init_db():
@@ -147,7 +190,6 @@ def init_db():
             )
         """)
 
-        # 初期アカウント
         cur.execute("SELECT COUNT(*) FROM accounts")
         if cur.fetchone()[0] == 0:
             cur.execute("""
@@ -159,8 +201,10 @@ def init_db():
                 VALUES (?, ?, ?, ?, ?, ?)
             """, ("staff", "staff123", "職員", "職員", now_text(), now_text()))
 
-        # メモ初期化
-        cur.execute("INSERT OR IGNORE INTO dashboard_memos (id, memo, updated_at) VALUES (1, '', ?)", (now_text(),))
+        cur.execute(
+            "INSERT OR IGNORE INTO dashboard_memos (id, memo, updated_at) VALUES (1, '', ?)",
+            (now_text(),)
+        )
 
         conn.commit()
 
@@ -282,12 +326,55 @@ def month_schedule():
     ])
 
 
+def duplicate_usage_exists(use_date, user_id, item_id, exclude_id=None):
+    if exclude_id is None:
+        df = query_df("""
+            SELECT COUNT(*) AS cnt
+            FROM usage_logs
+            WHERE use_date = ? AND user_id = ? AND item_id = ?
+        """, (use_date, user_id, item_id))
+    else:
+        df = query_df("""
+            SELECT COUNT(*) AS cnt
+            FROM usage_logs
+            WHERE use_date = ? AND user_id = ? AND item_id = ? AND id <> ?
+        """, (use_date, user_id, item_id, exclude_id))
+
+    return safe_int(df.iloc[0]["cnt"]) > 0
+
+
+def get_current_stock(item_id):
+    df = query_df("SELECT current_stock FROM stock WHERE item_id = ?", (item_id,))
+    if df.empty:
+        return 0
+    return safe_int(df.iloc[0]["current_stock"])
+
+
+def usage_warnings(use_date, user_id, item_id, qty, unit_price, exclude_id=None):
+    warnings = []
+
+    if qty >= 20:
+        warnings.append(f"数量が多めです（{qty}）。入力ミスでないか確認してください。")
+
+    if unit_price <= 0:
+        warnings.append("単価が0円です。請求対象外でよいか確認してください。")
+
+    current_stock = get_current_stock(item_id)
+    if current_stock - qty < 0:
+        warnings.append(f"在庫がマイナスになります。現在庫：{current_stock}、使用数：{qty}")
+
+    if duplicate_usage_exists(use_date, user_id, item_id, exclude_id=exclude_id):
+        warnings.append("同じ日付・同じ利用者・同じ物品の記録がすでにあります。重複登録でないか確認してください。")
+
+    return warnings
+
+
 # ============================================================
 # ログイン
 # ============================================================
 
 def login_screen():
-    st.title("📦 物品管理アプリ Ver2.0 SQLite版")
+    st.title("📦 物品管理アプリ Ver2.1 SQLite安定性強化版")
     st.subheader("ログイン")
 
     with st.form("login_form"):
@@ -341,10 +428,11 @@ def logout_button():
 # 初期化
 # ============================================================
 init_db()
+auto_backup_once_per_day()
 require_login()
 
-st.title("📦 物品管理アプリ Ver2.0 SQLite版")
-st.caption("SQLiteリレーショナルDB版／Ver1.5.1 Excel版とは別アプリとして並行テスト用")
+st.title("📦 物品管理アプリ Ver2.1 SQLite安定性強化版")
+st.caption("自動バックアップ／手動バックアップ／削除確認／入力ミス警告／SQLiteリレーショナルDB")
 
 role = st.session_state.get("role", "職員")
 available_menus = ADMIN_MENUS if role == "管理者" else STAFF_MENUS
@@ -385,6 +473,14 @@ if menu == "管理ダッシュボード":
     col4.metric("今月物品費", f"{month_total:,}円")
 
     st.markdown("---")
+
+    if st.button("手動バックアップを作成"):
+        path = backup_db(reason="manual")
+        if path:
+            st.success(f"バックアップを作成しました：{path.name}")
+        else:
+            st.error("DBファイルが見つかりません。")
+
     left, right = st.columns([1.3, 1])
 
     with left:
@@ -470,11 +566,23 @@ elif menu == "使用記録 登録":
             st.write(f"単価：{price:,}円")
             st.write(f"金額：{amount:,}円")
 
+            user_id = int(user_map[user_name])
+            item_id = int(item_map[item_name])
+            warn_list = usage_warnings(d.strftime("%Y-%m-%d"), user_id, item_id, qty, price)
+
+            if warn_list:
+                for w in warn_list:
+                    st.warning(w)
+                confirm_warning = st.checkbox("警告内容を確認しました。この内容で登録します。")
+            else:
+                confirm_warning = True
+
             ok = st.form_submit_button("登録する")
 
         if ok:
-            user_id = int(user_map[user_name])
-            item_id = int(item_map[item_name])
+            if warn_list and not confirm_warning:
+                st.error("警告があるため、確認チェックを入れてから登録してください。")
+                st.stop()
 
             with get_conn() as conn:
                 conn.execute("""
@@ -559,16 +667,40 @@ elif menu == "使用記録 検索・更新・削除":
                 new_qty = st.number_input("数量", min_value=1, max_value=9999, value=max(1, safe_int(row["数量"])))
                 new_note = st.text_input("備考", str(row.get("備考", "")))
 
+                new_user_id = int(user_map[new_user_name])
+                new_item_id = int(item_map[new_item_name])
+                item_row = items[items["物品ID"].astype(int) == new_item_id].iloc[0]
+                new_price = safe_int(item_row["単価"])
+                warn_list = usage_warnings(
+                    new_date.strftime("%Y-%m-%d"),
+                    new_user_id,
+                    new_item_id,
+                    new_qty,
+                    new_price,
+                    exclude_id=int(selected_id)
+                )
+
+                if warn_list:
+                    for w in warn_list:
+                        st.warning(w)
+                    confirm_warning = st.checkbox("警告内容を確認しました。この内容で更新します。")
+                else:
+                    confirm_warning = True
+
+                st.markdown("#### 削除する場合の確認")
+                delete_confirm = st.checkbox("この使用記録を削除することを確認しました。")
+                delete_text = st.text_input("削除する場合は DELETE と入力")
+
                 c1, c2 = st.columns(2)
                 update = c1.form_submit_button("更新する")
                 delete = c2.form_submit_button("削除する")
 
             if update:
-                new_user_id = int(user_map[new_user_name])
-                new_item_id = int(item_map[new_item_name])
-                item_row = items[items["物品ID"].astype(int) == new_item_id].iloc[0]
-                price = safe_int(item_row["単価"])
-                amount = new_qty * price
+                if warn_list and not confirm_warning:
+                    st.error("警告があるため、確認チェックを入れてから更新してください。")
+                    st.stop()
+
+                amount = new_qty * new_price
 
                 execute("""
                     UPDATE usage_logs
@@ -576,13 +708,17 @@ elif menu == "使用記録 検索・更新・削除":
                     WHERE id = ?
                 """, (
                     new_date.strftime("%Y-%m-%d"), new_user_id, new_item_id,
-                    new_qty, price, amount, new_note, now_text(), int(selected_id)
+                    new_qty, new_price, amount, new_note, now_text(), int(selected_id)
                 ))
 
                 st.success("使用記録を更新しました。※在庫は必要に応じて現在庫画面で調整してください。")
                 st.rerun()
 
             if delete:
+                if not delete_confirm or delete_text != "DELETE":
+                    st.error("削除するには確認チェックを入れ、DELETE と入力してください。")
+                    st.stop()
+
                 execute("DELETE FROM usage_logs WHERE id = ?", (int(selected_id),))
                 st.success("使用記録を削除しました。※在庫は必要に応じて現在庫画面で調整してください。")
                 st.rerun()
@@ -611,9 +747,20 @@ elif menu == "現在庫 登録・更新":
             item_name = st.selectbox("物品", list(item_map.keys()))
             mode = st.radio("処理", ["入庫として加算", "実在庫数に修正"])
             qty = st.number_input("数量", min_value=0, max_value=99999, value=1)
+
+            if qty >= 100:
+                st.warning("数量が多めです。入力ミスでないか確認してください。")
+                confirm_large_qty = st.checkbox("数量を確認しました。")
+            else:
+                confirm_large_qty = True
+
             ok = st.form_submit_button("在庫を更新する")
 
         if ok:
+            if not confirm_large_qty:
+                st.error("数量確認チェックを入れてください。")
+                st.stop()
+
             item_id = int(item_map[item_name])
             if mode == "入庫として加算":
                 execute("""
@@ -772,11 +919,19 @@ elif menu == "利用者マスタ 登録・更新・削除":
             new_billing = st.text_input("請求先", str(row["請求先"]))
             new_note = st.text_input("備考", str(row["備考"]))
 
+            st.markdown("#### 削除する場合の確認")
+            delete_confirm = st.checkbox("この利用者を削除することを確認しました。")
+            delete_text = st.text_input("削除する場合は DELETE と入力")
+
             c1, c2 = st.columns(2)
             update = c1.form_submit_button("更新する")
             delete = c2.form_submit_button("削除する")
 
         if update:
+            if not new_name.strip():
+                st.error("利用者名は空欄にできません。")
+                st.stop()
+
             try:
                 execute("""
                     UPDATE users
@@ -789,6 +944,10 @@ elif menu == "利用者マスタ 登録・更新・削除":
                 st.error("同じ利用者名がすでに登録されています。")
 
         if delete:
+            if not delete_confirm or delete_text != "DELETE":
+                st.error("削除するには確認チェックを入れ、DELETE と入力してください。")
+                st.stop()
+
             count = query_df("SELECT COUNT(*) AS cnt FROM usage_logs WHERE user_id = ?", (int(selected),)).iloc[0]["cnt"]
             if int(count) > 0:
                 st.error("使用記録に使われている利用者は削除できません。")
@@ -811,11 +970,20 @@ elif menu == "物品マスタ 登録・更新・削除":
         min_stock = st.number_input("最低在庫", min_value=0, max_value=99999, value=0)
         url = st.text_input("FEED商品URL")
         note = st.text_input("備考")
+
+        if price <= 0:
+            st.warning("単価が0円です。請求対象外でよいか確認してください。")
+            confirm_zero_price = st.checkbox("単価0円で登録することを確認しました。")
+        else:
+            confirm_zero_price = True
+
         ok = st.form_submit_button("登録する")
 
     if ok:
         if not name.strip():
             st.error("物品名を入力してください。")
+        elif not confirm_zero_price:
+            st.error("単価0円の確認チェックを入れてください。")
         else:
             try:
                 with get_conn() as conn:
@@ -861,11 +1029,29 @@ elif menu == "物品マスタ 登録・更新・削除":
             new_url = st.text_input("FEED商品URL", str(row["FEED商品URL"]))
             new_note = st.text_input("備考", str(row["備考"]))
 
+            if new_price <= 0:
+                st.warning("単価が0円です。請求対象外でよいか確認してください。")
+                confirm_zero_price_edit = st.checkbox("単価0円で更新することを確認しました。")
+            else:
+                confirm_zero_price_edit = True
+
+            st.markdown("#### 削除する場合の確認")
+            delete_confirm = st.checkbox("この物品を削除することを確認しました。")
+            delete_text = st.text_input("削除する場合は DELETE と入力")
+
             c1, c2 = st.columns(2)
             update = c1.form_submit_button("更新する")
             delete = c2.form_submit_button("削除する")
 
         if update:
+            if not new_name.strip():
+                st.error("物品名は空欄にできません。")
+                st.stop()
+
+            if not confirm_zero_price_edit:
+                st.error("単価0円の確認チェックを入れてください。")
+                st.stop()
+
             try:
                 execute("""
                     UPDATE items
@@ -879,6 +1065,10 @@ elif menu == "物品マスタ 登録・更新・削除":
                 st.error("同じ物品名がすでに登録されています。")
 
         if delete:
+            if not delete_confirm or delete_text != "DELETE":
+                st.error("削除するには確認チェックを入れ、DELETE と入力してください。")
+                st.stop()
+
             count = query_df("SELECT COUNT(*) AS cnt FROM usage_logs WHERE item_id = ?", (int(selected),)).iloc[0]["cnt"]
             if int(count) > 0:
                 st.error("使用記録に使われている物品は削除できません。")
@@ -894,7 +1084,6 @@ elif menu == "物品マスタ 登録・更新・削除":
 # ============================================================
 elif menu == "ログイン設定":
     st.subheader("ログイン設定")
-    st.caption("管理者のみ利用できます。職員用ID・パスワードの変更や追加ができます。")
 
     if st.session_state.get("role") != "管理者":
         st.error("このメニューは管理者のみ使用できます。")
@@ -952,18 +1141,22 @@ elif menu == "ログイン設定":
         with st.form("account_edit"):
             st.text_input("ログインID", str(row["ログインID"]), disabled=True)
             edit_pw = st.text_input("新しいパスワード", value=str(row["パスワード"]), type="password")
-            edit_role = st.selectbox(
-                "権限",
-                ["職員", "管理者"],
-                index=0 if str(row["権限"]) == "職員" else 1
-            )
+            edit_role = st.selectbox("権限", ["職員", "管理者"], index=0 if str(row["権限"]) == "職員" else 1)
             edit_name = st.text_input("表示名", str(row["表示名"]))
+
+            st.markdown("#### 削除する場合の確認")
+            delete_confirm = st.checkbox("このアカウントを削除することを確認しました。")
+            delete_text = st.text_input("削除する場合は DELETE と入力")
 
             c1, c2 = st.columns(2)
             update_ok = c1.form_submit_button("更新する")
             delete_ok = c2.form_submit_button("削除する")
 
         if update_ok:
+            if not edit_pw.strip():
+                st.error("パスワードは空欄にできません。")
+                st.stop()
+
             execute("""
                 UPDATE accounts
                 SET password = ?, role = ?, display_name = ?, updated_at = ?
@@ -973,6 +1166,10 @@ elif menu == "ログイン設定":
             st.rerun()
 
         if delete_ok:
+            if not delete_confirm or delete_text != "DELETE":
+                st.error("削除するには確認チェックを入れ、DELETE と入力してください。")
+                st.stop()
+
             admin_count = query_df("SELECT COUNT(*) AS cnt FROM accounts WHERE role = '管理者'").iloc[0]["cnt"]
             target_role = str(row["権限"])
 
@@ -985,7 +1182,43 @@ elif menu == "ログイン設定":
                 st.success("アカウントを削除しました。")
                 st.rerun()
 
-    st.warning("注意：このVer2.0ではパスワードはSQLiteに平文保存です。施設内の簡易テスト向けです。本格運用では暗号化を検討してください。")
+    st.warning("注意：このVer2.1ではパスワードはSQLiteに平文保存です。施設内の簡易テスト向けです。")
+
+
+# ============================================================
+# バックアップ管理
+# ============================================================
+elif menu == "バックアップ管理":
+    st.subheader("バックアップ管理")
+    st.caption("DBの自動バックアップ・手動バックアップ・ダウンロードを行います。")
+
+    if st.button("手動バックアップを作成する"):
+        path = backup_db(reason="manual")
+        if path:
+            st.success(f"バックアップを作成しました：{path.name}")
+        else:
+            st.error("DBファイルが見つかりません。")
+
+    st.markdown("### バックアップ一覧")
+    backups = list_backups()
+
+    if backups.empty:
+        st.info("バックアップはまだありません。")
+    else:
+        st.dataframe(backups.drop(columns=["path"]), use_container_width=True)
+
+        selected_name = st.selectbox("ダウンロードするバックアップ", backups["ファイル名"].tolist())
+        selected_path = backups[backups["ファイル名"] == selected_name].iloc[0]["path"]
+
+        with open(selected_path, "rb") as f:
+            st.download_button(
+                "選択したバックアップDBをダウンロード",
+                f.read(),
+                file_name=selected_name,
+                mime="application/octet-stream"
+            )
+
+    st.info("自動バックアップはアプリ起動時に1日1回作成されます。保存先は data/backups/ です。")
 
 
 # ============================================================
